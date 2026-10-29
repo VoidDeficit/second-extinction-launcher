@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Second Extinction (Custom Server)
+Comment=Patch and start Second Extinction against a custom server
+Exec=se-launcher
+Icon=steam_icon_1024380
+Terminal=false
+Categories=Game;

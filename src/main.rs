@@ -1,312 +1,265 @@
 //! Second Extinction launcher for a custom backend (Linux / Proton).
 //!
-//! Steps: find the game, patch the exe (Steam matchmaking instead of PlayFab Party),
-//! trust the server's CA and route WinHTTP through its proxy in the Proton prefix,
-//! then start the game through Steam with the Apex Connect redirect flags.
+//! Without arguments it opens a window; with arguments it runs as a CLI:
+//!   se-launcher --server HOST [--social-port N] [--proxy-port N] [--game-dir DIR] [--no-launch]
+//!   se-launcher --revert [--game-dir DIR]
 
-use sha1::Sha1;
-use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
-use std::process::{Command, exit};
-use std::{env, fs};
+mod core;
 
-const APP_ID: &str = "1024380";
-const EXE: &str = "SecondExtinction_F.exe";
-/// sha256 of the build the patch offsets were taken from.
-const EXE_SHA256: &str = "1a80f8b3168be1ba24e5f1d47da959c5ddbe54e4e6cc76ea7f54e31bfc483743";
-/// (file offset, original, patched): crossplay flag default (VA 0x1434a6aa0) 1 -> 0, which makes
-/// the backend choice at 0x140bf34f5 build the Steam matchmaking backend instead of PlayFab Party.
-const PATCHES: &[(usize, u8, u8)] = &[(0x34A4AA0, 1, 0)];
+use core::Settings;
+use eframe::egui;
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::{env, fs, process::exit, thread};
 
-const CERT_KEY: &str = r"HKEY_LOCAL_MACHINE\Software\Microsoft\SystemCertificates\Root\Certificates";
-const CONN_KEY: &str =
-    r"HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Internet Settings\Connections";
-
-struct Opts {
-    server: Option<String>,
-    social_port: u16,
-    proxy_port: u16,
-    revert: bool,
-    no_launch: bool,
-    game_dir: Option<PathBuf>,
+fn config_path() -> Option<PathBuf> {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("se-launcher/settings"))
 }
+
+fn load_settings() -> Settings {
+    let mut s = Settings::default();
+    let text = config_path().and_then(|p| fs::read_to_string(p).ok()).unwrap_or_default();
+    for line in text.lines() {
+        match line.split_once('=') {
+            Some(("server", v)) => s.server = v.to_string(),
+            Some(("social_port", v)) => s.social_port = v.parse().unwrap_or(s.social_port),
+            Some(("proxy_port", v)) => s.proxy_port = v.parse().unwrap_or(s.proxy_port),
+            Some(("game_dir", v)) if !v.is_empty() => s.game_dir = Some(PathBuf::from(v)),
+            _ => {}
+        }
+    }
+    s
+}
+
+fn save_settings(s: &Settings) {
+    let Some(p) = config_path() else { return };
+    fs::create_dir_all(p.parent().unwrap()).ok();
+    let dir = s.game_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
+    fs::write(p, format!(
+        "server={}\nsocial_port={}\nproxy_port={}\ngame_dir={dir}\n",
+        s.server, s.social_port, s.proxy_port
+    ))
+    .ok();
+}
+
+// ---- CLI ------------------------------------------------------------------------
 
 fn usage() -> ! {
     eprintln!(
-        "usage: se-launcher --server HOST [--social-port 8443] [--proxy-port 8888]\n\
+        "usage: se-launcher                 (opens the launcher window)\n\
+         \x20      se-launcher --server HOST [--social-port 8443] [--proxy-port 8888]\n\
          \x20                  [--game-dir DIR] [--no-launch]\n\
          \x20      se-launcher --revert [--game-dir DIR]"
     );
     exit(2)
 }
 
-fn parse_args() -> Opts {
-    let mut o = Opts { server: None, social_port: 8443, proxy_port: 8888, revert: false, no_launch: false, game_dir: None };
-    let mut it = env::args().skip(1);
+fn run_cli(args: Vec<String>) {
+    let mut s = Settings::default();
+    let (mut revert, mut no_launch, mut server) = (false, false, None);
+    let mut it = args.into_iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| usage());
         match a.as_str() {
-            "--server" => o.server = Some(val()),
-            "--social-port" => o.social_port = val().parse().unwrap_or_else(|_| usage()),
-            "--proxy-port" => o.proxy_port = val().parse().unwrap_or_else(|_| usage()),
-            "--game-dir" => o.game_dir = Some(PathBuf::from(val())),
-            "--revert" => o.revert = true,
-            "--no-launch" => o.no_launch = true,
+            "--server" => server = Some(val()),
+            "--social-port" => s.social_port = val().parse().unwrap_or_else(|_| usage()),
+            "--proxy-port" => s.proxy_port = val().parse().unwrap_or_else(|_| usage()),
+            "--game-dir" => s.game_dir = Some(PathBuf::from(val())),
+            "--revert" => revert = true,
+            "--no-launch" => no_launch = true,
             _ => usage(),
         }
     }
-    if !o.revert && o.server.is_none() {
-        usage()
-    }
-    o
-}
-
-fn die(msg: impl AsRef<str>) -> ! {
-    eprintln!("error: {}", msg.as_ref());
-    exit(1)
-}
-
-fn steam_root() -> PathBuf {
-    let home = PathBuf::from(env::var("HOME").unwrap_or_else(|_| die("HOME not set")));
-    [".local/share/Steam", ".steam/steam", ".var/app/com.valvesoftware.Steam/.local/share/Steam"]
-        .iter()
-        .map(|p| home.join(p))
-        .find(|p| p.join("steamapps").is_dir())
-        .unwrap_or_else(|| die("Steam installation not found"))
-}
-
-/// Library folders from libraryfolders.vdf ("path" entries).
-fn libraries(root: &Path) -> Vec<PathBuf> {
-    let vdf = fs::read_to_string(root.join("steamapps/libraryfolders.vdf")).unwrap_or_default();
-    let mut libs = vec![root.to_path_buf()];
-    for line in vdf.lines() {
-        let parts: Vec<&str> = line.split('"').collect();
-        if parts.len() >= 4 && parts[1] == "path" {
-            libs.push(PathBuf::from(parts[3].replace("\\\\", "\\")));
-        }
-    }
-    libs
-}
-
-/// (game dir, library dir)
-fn find_game(o: &Opts) -> (PathBuf, PathBuf) {
-    if let Some(d) = &o.game_dir {
-        let lib = d.ancestors().nth(3).unwrap_or_else(|| die("cannot derive library from --game-dir"));
-        return (d.clone(), lib.to_path_buf());
-    }
-    libraries(&steam_root())
-        .into_iter()
-        .map(|l| (l.join("steamapps/common/SecondExtinction"), l))
-        .find(|(g, _)| g.join(EXE).is_file())
-        .unwrap_or_else(|| die("Second Extinction not found in any Steam library; use --game-dir"))
-}
-
-fn game_running() -> bool {
-    fs::read_dir("/proc").into_iter().flatten().flatten().any(|e| {
-        fs::read(e.path().join("cmdline"))
-            .map(|c| {
-                // argv[0] only, so shells/editors mentioning the name don't count
-                let argv0 = c.split(|&b| b == 0).next().unwrap_or_default();
-                String::from_utf8_lossy(argv0).replace('\\', "/").ends_with(EXE)
-            })
-            .unwrap_or(false)
-    })
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-fn patch_exe(game: &Path) {
-    let exe = game.join(EXE);
-    let backup = game.join(format!("{EXE}.orig"));
-    let mut data = fs::read(&exe).unwrap_or_else(|e| die(format!("read {}: {e}", exe.display())));
-    if !backup.exists() {
-        if hex(&Sha256::digest(&data)) != EXE_SHA256 {
-            die("exe does not match the analyzed build (game updated?); refusing to patch");
-        }
-        fs::copy(&exe, &backup).unwrap_or_else(|e| die(format!("backup: {e}")));
-        println!("backup   {}", backup.display());
-    }
-    for &(off, old, new) in PATCHES {
-        match data[off] {
-            b if b == new => println!("patch    {off:#x} already applied"),
-            b if b == old => {
-                data[off] = new;
-                println!("patch    {off:#x}: {old:#04x} -> {new:#04x} (Steam matchmaking)");
-            }
-            b => die(format!("unexpected byte {b:#04x} at {off:#x}")),
-        }
-    }
-    fs::write(&exe, data).unwrap_or_else(|e| die(format!("write exe: {e}")));
-}
-
-fn revert_exe(game: &Path) {
-    let backup = game.join(format!("{EXE}.orig"));
-    if backup.exists() {
-        fs::copy(&backup, game.join(EXE)).unwrap_or_else(|e| die(format!("restore: {e}")));
-        fs::remove_file(&backup).ok();
-        println!("restored {EXE}");
+    let log = |m: String| println!("{m}");
+    let res = if revert {
+        core::revert(&s, &log)
     } else {
-        println!("exe      no backup, nothing to restore");
-    }
-}
-
-fn pem_to_der(pem: &str) -> Vec<u8> {
-    let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
-    decode_b64(&b64).unwrap_or_else(|| die("server returned an invalid CA certificate"))
-}
-
-fn decode_b64(s: &str) -> Option<Vec<u8>> {
-    let val = |c: u8| match c {
-        b'A'..=b'Z' => Some(c - b'A'),
-        b'a'..=b'z' => Some(c - b'a' + 26),
-        b'0'..=b'9' => Some(c - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
+        s.server = server.unwrap_or_else(|| usage());
+        if no_launch {
+            core::find_game(&s).and_then(|g| {
+                core::patch_exe(&g, &log)?;
+                core::setup_prefix(&g, &s, &log)?;
+                log(format!("Launch skipped; game arguments: {}", core::launch_args(&s).join(" ")));
+                Ok(())
+            })
+        } else {
+            core::play(&s, &log)
+        }
     };
-    let bytes: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=').collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let v: Vec<u8> = chunk.iter().map(|&c| val(c)).collect::<Option<_>>()?;
-        let n = v.iter().enumerate().fold(0u32, |acc, (i, &x)| acc | (x as u32) << (18 - 6 * i));
-        out.extend_from_slice(&n.to_be_bytes()[1..chunk.len()]);
+    if let Err(e) = res {
+        eprintln!("error: {e}");
+        exit(1);
     }
-    Some(out)
 }
 
-fn reg_hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(",")
+// ---- GUI ------------------------------------------------------------------------
+
+enum Msg {
+    Log(String),
+    Done(Result<(), String>),
 }
 
-/// Wine registry cert store "Blob": serialized property (id 0x20 = CERT_CERT_PROP_ID, 1, len, DER).
-/// WinHttpSettings: magic 0x18, 0, flags 2 (PROXY_TYPE_PROXY), len+proxy, len+bypass.
-fn reg_file(ca_der: Option<&[u8]>, thumb: &str, proxy: Option<&str>) -> String {
-    let mut s = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
-    match ca_der {
-        Some(der) => {
-            let mut blob = Vec::new();
-            for v in [0x20u32, 1, der.len() as u32] {
-                blob.extend_from_slice(&v.to_le_bytes());
+struct App {
+    settings: Settings,
+    social_port: String,
+    proxy_port: String,
+    log: Vec<String>,
+    busy: bool,
+    rx: Receiver<Msg>,
+    tx: Sender<Msg>,
+    status: String,
+}
+
+impl App {
+    fn new() -> Self {
+        let settings = load_settings();
+        let (tx, rx) = channel();
+        let mut app = App {
+            social_port: settings.social_port.to_string(),
+            proxy_port: settings.proxy_port.to_string(),
+            settings,
+            log: Vec::new(),
+            busy: false,
+            rx,
+            tx,
+            status: String::new(),
+        };
+        app.refresh_status();
+        app
+    }
+
+    fn refresh_status(&mut self) {
+        self.status = match core::find_game(&self.settings) {
+            Ok(g) => {
+                let st = core::status(&g);
+                format!(
+                    "Game: {}\nExe: {}   Prefix: {}{}",
+                    g.dir.display(),
+                    if st.patched { "patched (Steam matchmaking)" } else { "original" },
+                    match &st.ca_thumbprint {
+                        Some(t) => format!("server CA {}…", &t[..t.len().min(12)]),
+                        None => "not configured".into(),
+                    },
+                    if core::game_running() { "   ● running" } else { "" }
+                )
             }
-            blob.extend_from_slice(der);
-            s += &format!("[{CERT_KEY}\\{thumb}]\r\n\"Blob\"=hex:{}\r\n\r\n", reg_hex(&blob));
-        }
-        None if !thumb.is_empty() => s += &format!("[-{CERT_KEY}\\{thumb}]\r\n\r\n"),
-        None => {}
+            Err(e) => format!("⚠ {e}"),
+        };
     }
-    s += &format!("[{CONN_KEY}]\r\n");
-    match proxy {
-        Some(p) => {
-            let mut v = Vec::new();
-            for x in [0x18u32, 0, 2, p.len() as u32] {
-                v.extend_from_slice(&x.to_le_bytes());
+
+    /// Validate the form into settings; None (with a log line) if a port is invalid.
+    fn apply_form(&mut self) -> Option<Settings> {
+        let (Ok(sp), Ok(pp)) = (self.social_port.trim().parse(), self.proxy_port.trim().parse()) else {
+            self.log.push("Ports must be numbers between 1 and 65535".into());
+            return None;
+        };
+        self.settings.server = self.settings.server.trim().to_string();
+        if self.settings.server.is_empty() {
+            self.log.push("Enter the server address".into());
+            return None;
+        }
+        self.settings.social_port = sp;
+        self.settings.proxy_port = pp;
+        save_settings(&self.settings);
+        Some(self.settings.clone())
+    }
+
+    fn run(&mut self, job: fn(&Settings, &dyn Fn(String)) -> core::Result<()>, ctx: &egui::Context) {
+        let Some(s) = self.apply_form() else { return };
+        self.busy = true;
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        thread::spawn(move || {
+            let log = |m: String| {
+                tx.send(Msg::Log(m)).ok();
+                ctx.request_repaint();
+            };
+            let res = job(&s, &log);
+            tx.send(Msg::Done(res)).ok();
+            ctx.request_repaint();
+        });
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        while let Ok(m) = self.rx.try_recv() {
+            match m {
+                Msg::Log(l) => self.log.push(l),
+                Msg::Done(r) => {
+                    self.busy = false;
+                    match r {
+                        Ok(()) => self.log.push("Done.".into()),
+                        Err(e) => self.log.push(format!("Error: {e}")),
+                    }
+                    self.refresh_status();
+                }
             }
-            v.extend_from_slice(p.as_bytes());
-            v.extend_from_slice(&0u32.to_le_bytes());
-            s += &format!("\"WinHttpSettings\"=hex:{}\r\n", reg_hex(&v));
         }
-        None => s += "\"WinHttpSettings\"=-\r\n",
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Second Extinction — custom server");
+            ui.add_space(8.0);
+
+            egui::Grid::new("form").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("Server");
+                ui.add(egui::TextEdit::singleline(&mut self.settings.server).hint_text("IP or hostname").desired_width(260.0));
+                ui.end_row();
+                ui.label("Social port");
+                ui.add(egui::TextEdit::singleline(&mut self.social_port).desired_width(80.0));
+                ui.end_row();
+                ui.label("Proxy port");
+                ui.add(egui::TextEdit::singleline(&mut self.proxy_port).desired_width(80.0));
+                ui.end_row();
+            });
+
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(&self.status).small());
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!self.busy, |ui| {
+                    let play = egui::Button::new(egui::RichText::new("▶  Play").size(18.0)).min_size([140.0, 36.0].into());
+                    if ui.add(play).on_hover_text("Patch the exe, configure the Proton prefix and start the game").clicked() {
+                        self.run(core::play, ctx);
+                    }
+                    if ui.button("Revert").on_hover_text("Restore the original exe and remove the server CA/proxy").clicked() {
+                        self.run(core::revert, ctx);
+                    }
+                    if ui.button("Refresh").clicked() {
+                        self.refresh_status();
+                    }
+                });
+                if self.busy {
+                    ui.spinner();
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.separator();
+            egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false; 2]).show(ui, |ui| {
+                for l in &self.log {
+                    let text = egui::RichText::new(l).monospace();
+                    ui.label(if l.starts_with("Error") { text.color(ui.visuals().error_fg_color) } else { text });
+                }
+            });
+        });
     }
-    s
-}
-
-/// Proton's wine binary for this prefix, from compatdata/<app>/config_info (line 2 = fonts dir).
-fn proton_wine(compat: &Path) -> PathBuf {
-    let info = fs::read_to_string(compat.join("config_info"))
-        .unwrap_or_else(|_| die("no config_info; start the game once through Steam first"));
-    let fonts = info.lines().nth(1).unwrap_or_else(|| die("unexpected config_info format"));
-    let files = Path::new(fonts.trim_end_matches('/')).ancestors().nth(2).unwrap_or_else(|| die("bad fonts path"));
-    let wine = files.join("bin/wine");
-    if !wine.is_file() {
-        die(format!("Proton wine not found at {}", wine.display()));
-    }
-    wine
-}
-
-fn import_reg(compat: &Path, reg: &str) {
-    let tmp = env::temp_dir().join("se-launcher.reg");
-    let utf16: Vec<u8> = [0xFEFFu16].into_iter().chain(reg.encode_utf16()).flat_map(|c| c.to_le_bytes()).collect();
-    fs::write(&tmp, utf16).unwrap_or_else(|e| die(format!("write reg: {e}")));
-    let status = Command::new(proton_wine(compat))
-        .env("WINEPREFIX", compat.join("pfx"))
-        .env("WINEDEBUG", "-all")
-        .args(["regedit", "/S"])
-        .arg(format!("Z:{}", tmp.display()))
-        .status()
-        .unwrap_or_else(|e| die(format!("run wine: {e}")));
-    fs::remove_file(&tmp).ok();
-    if !status.success() {
-        die("regedit failed");
-    }
-    // let wineserver flush the registry to disk
-    Command::new(proton_wine(compat).with_file_name("wineserver"))
-        .env("WINEPREFIX", compat.join("pfx"))
-        .arg("-w")
-        .status()
-        .ok();
-}
-
-fn state_file(compat: &Path) -> PathBuf {
-    compat.join("se-launcher-ca.sha1")
-}
-
-fn setup_prefix(compat: &Path, server: &str, o: &Opts) {
-    let url = format!("http://{server}:{}/ca.pem", o.social_port);
-    let pem = ureq::get(&url)
-        .call()
-        .unwrap_or_else(|e| die(format!("fetch {url}: {e}")))
-        .into_string()
-        .unwrap_or_else(|e| die(format!("read CA: {e}")));
-    let der = pem_to_der(&pem);
-    let thumb = hex(&Sha1::digest(&der)).to_uppercase();
-    let proxy = format!("{server}:{}", o.proxy_port);
-    // drop a CA from a previous server before trusting the new one
-    if let Ok(old) = fs::read_to_string(state_file(compat)) {
-        if old.trim() != thumb {
-            import_reg(compat, &reg_file(None, old.trim(), Some(&proxy)));
-        }
-    }
-    import_reg(compat, &reg_file(Some(&der), &thumb, Some(&proxy)));
-    fs::write(state_file(compat), &thumb).ok();
-    println!("prefix   trusts CA {thumb}, WinHTTP proxy {proxy}");
-}
-
-fn revert_prefix(compat: &Path) {
-    let thumb = fs::read_to_string(state_file(compat)).unwrap_or_default();
-    import_reg(compat, &reg_file(None, thumb.trim(), None));
-    fs::remove_file(state_file(compat)).ok();
-    println!("prefix   removed CA and WinHTTP proxy");
 }
 
 fn main() {
-    let o = parse_args();
-    if game_running() {
-        die("Second Extinction is running; close it first");
+    let args: Vec<String> = env::args().skip(1).collect();
+    if !args.is_empty() {
+        return run_cli(args);
     }
-    let (game, lib) = find_game(&o);
-    let compat = lib.join("steamapps/compatdata").join(APP_ID);
-    println!("game     {}", game.display());
-
-    if o.revert {
-        revert_exe(&game);
-        revert_prefix(&compat);
-        return;
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([520.0, 420.0]).with_title("Second Extinction Launcher"),
+        ..Default::default()
+    };
+    if let Err(e) = eframe::run_native("se-launcher", opts, Box::new(|_| Ok(Box::new(App::new())))) {
+        eprintln!("error: cannot open window: {e}");
+        exit(1);
     }
-    let server = o.server.as_deref().unwrap();
-    patch_exe(&game);
-    setup_prefix(&compat, server, &o);
-
-    let args = ["--social-host", server, "--social-port", &o.social_port.to_string(), "--social-disable-ssl"];
-    if o.no_launch {
-        println!("launch   skipped; game arguments: {}", args.join(" "));
-        return;
-    }
-    Command::new("steam")
-        .args(["-applaunch", APP_ID])
-        .args(args)
-        .spawn()
-        .unwrap_or_else(|e| die(format!("start steam: {e}")));
-    println!("launch   steam -applaunch {APP_ID} {}", args.join(" "));
 }

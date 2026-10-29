@@ -14,9 +14,17 @@ Prepares Second Extinction (Steam, Linux/Proton) for a custom backend from
 
 ## Usage
 ```
-cargo build --release
-./target/release/se-launcher --server <host>            # set up and start
-./target/release/se-launcher --server <host> --no-launch
-./target/release/se-launcher --revert                   # original exe, CA and proxy removed
+cargo install --path .
+cp se-launcher.desktop ~/.local/share/applications/   # adjust Exec= if ~/.cargo/bin is not in PATH
+se-launcher                                            # opens the launcher window
+```
+Enter the server address and press **Play**. The launcher patches the exe, configures the prefix and starts the game.
+**Revert** restores the original exe and removes the CA and proxy.
+The settings are saved in `~/.config/se-launcher/settings`.
+
+Command line (same steps, no window):
+```
+se-launcher --server <host> [--social-port 8443] [--proxy-port 8888] [--game-dir DIR] [--no-launch]
+se-launcher --revert
 ```
 Close the game before running it. Steam's "Verify integrity of game files" also restores the exe.
