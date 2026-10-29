@@ -245,7 +245,7 @@ impl App {
             proxy_port: settings.proxy_port.to_string(),
             settings,
             log: Vec::new(),
-            show_log: false,
+            show_log: true,
             busy: false,
             rx,
             tx,
@@ -468,34 +468,29 @@ impl App {
         });
     }
 
-    fn log_drawer(&mut self, ctx: &egui::Context) {
-        if !self.show_log {
-            return;
-        }
-        egui::Window::new("log")
-            .title_bar(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_TOP, vec2(0.0, 150.0))
-            .fixed_size(vec2(620.0, 170.0))
+    /// Log panel docked along the bottom of the window.
+    fn log_panel(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("log")
+            .exact_height(150.0)
+            .show_separator_line(false)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(6, 6, 8, 235))
-                    .stroke(Stroke::new(1.0_f32, GOLD.gamma_multiply(0.4)))
-                    .corner_radius(CornerRadius::same(6))
-                    .inner_margin(egui::Margin::same(12)),
+                    .fill(Color32::from_rgb(5, 5, 6))
+                    .stroke(Stroke::new(1.0_f32, GOLD.gamma_multiply(0.35)))
+                    .inner_margin(egui::Margin::symmetric(40, 10)),
             )
-            .show(ctx, |ui| {
+            .show_animated(ctx, self.show_log, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("LOG").size(12.0).color(GOLD).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("✕").clicked() {
-                            self.show_log = false;
+                        if ui.small_button("Clear").clicked() {
+                            self.log.clear();
                         }
                     });
                 });
                 egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false; 2]).show(ui, |ui| {
                     if self.log.is_empty() {
-                        ui.label(egui::RichText::new("Nothing yet. Press PLAY.").color(MUTED).monospace());
+                        ui.label(egui::RichText::new("Nothing yet. Press PLAY.").color(MUTED).monospace().size(12.0));
                     }
                     for l in &self.log {
                         let c = if l.starts_with("Error") { RED } else { CREAM };
@@ -509,13 +504,13 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.drain();
+        self.log_panel(ctx);
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
             let full = ui.max_rect();
             self.background(ui, full);
             self.header(ui, full);
             self.controls(ui, full, ctx);
         });
-        self.log_drawer(ctx);
         // the game can start/exit outside the launcher; keep the chips current
         ctx.request_repaint_after(Duration::from_secs(2));
         if ctx.input(|i| i.time) as u64 % 2 == 0 {
@@ -527,8 +522,8 @@ impl eframe::App for App {
 pub fn run() -> eframe::Result {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 600.0])
-            .with_min_inner_size([820.0, 520.0])
+            .with_inner_size([980.0, 740.0])
+            .with_min_inner_size([820.0, 600.0])
             .with_title("Second Extinction — Custom Server"),
         ..Default::default()
     };
