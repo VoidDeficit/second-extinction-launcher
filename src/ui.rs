@@ -43,6 +43,7 @@ struct App {
     settings: Settings,
     social_port: String,
     proxy_port: String,
+    emulator: String,
     log: Vec<String>,
     show_log: bool,
     busy: bool,
@@ -216,9 +217,22 @@ fn ghost_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response 
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext) -> Self {
+    fn new(cc: &eframe::CreationContext, overrides: crate::Overrides) -> Self {
         style(&cc.egui_ctx);
-        let settings = load_settings();
+        let mut settings = load_settings();
+        if let Some(standalone) = overrides.standalone {
+            settings.standalone = standalone;
+        }
+        if let Some(dev_mode) = overrides.dev_mode {
+            settings.dev_mode = dev_mode;
+        }
+        if let Some(emulator_dir) = overrides.emulator_dir {
+            settings.emulator_dir = Some(emulator_dir);
+        }
+        if settings.dev_mode {
+            settings.standalone = true;
+        }
+        let emulator = settings.emulator_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
         let (tx, rx) = channel();
         let probe_target = Arc::new(Mutex::new((settings.server.clone(), settings.social_port)));
         let server_state = Arc::new(AtomicU8::new(SERVER_UNKNOWN));
@@ -243,6 +257,7 @@ impl App {
         let mut app = App {
             social_port: settings.social_port.to_string(),
             proxy_port: settings.proxy_port.to_string(),
+            emulator,
             settings,
             log: Vec::new(),
             show_log: true,
@@ -283,6 +298,11 @@ impl App {
         }
         self.settings.social_port = sp;
         self.settings.proxy_port = pp;
+        let emulator = self.emulator.trim();
+        self.settings.emulator_dir = (!emulator.is_empty()).then(|| PathBuf::from(emulator));
+        if self.settings.dev_mode {
+            self.settings.standalone = true;
+        }
         save_settings(&self.settings);
         Some(self.settings.clone())
     }
@@ -339,7 +359,7 @@ impl App {
         p.add(Shape::mesh(m));
         stripes(p, full);
         // thin gold rule above the controls, like the in-game separators
-        let y = full.bottom() - 212.0;
+        let y = full.bottom() - 266.0;
         let rule = Rect::from_min_max(pos2(full.left() + 40.0, y), pos2(full.right() - 40.0, y + 1.0));
         let mut m = Mesh::default();
         for (q, c) in [
@@ -376,7 +396,7 @@ impl App {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, full: Rect, ctx: &egui::Context) {
-        let area = Rect::from_min_max(pos2(full.left() + 40.0, full.bottom() - 196.0), pos2(full.right() - 40.0, full.bottom() - 24.0));
+        let area = Rect::from_min_max(pos2(full.left() + 40.0, full.bottom() - 250.0), pos2(full.right() - 40.0, full.bottom() - 24.0));
         let card_w = (area.width() - 320.0).max(360.0);
         let card = Rect::from_min_size(area.min, vec2(card_w, area.height()));
 
@@ -404,6 +424,77 @@ impl App {
                         }
                     });
                     ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.add_enabled(
+                            !self.busy,
+                            egui::Checkbox::new(
+                                &mut self.settings.standalone,
+                                egui::RichText::new("Play without Steam").size(12.0),
+                            ),
+                        )
+                        .on_hover_text(
+                            "Start through Proton with the Steam emulator instead of Steam. Uses your signed-in Steam account's ID, name and avatar. A friend who owns the game on Steam must also use this mode to join your lobby.",
+                        );
+                        ui.add_enabled(
+                            !self.busy,
+                            egui::Checkbox::new(
+                                &mut self.settings.dev_mode,
+                                egui::RichText::new("Dev mode: multiple players").size(12.0),
+                            ),
+                        )
+                        .on_hover_text(
+                            "Run several clients at once, each with its own emulator identity, saves and isolated Proton prefix. Press PLAY again for the next player.",
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_enabled(
+                            !self.busy,
+                            egui::Checkbox::new(
+                                &mut self.settings.mixed,
+                                egui::RichText::new("Mixed: Steam + emulated player").size(12.0),
+                            ),
+                        )
+                        .on_hover_text(
+                            "Start one real Steam client and one Goldberg client together. They use separate steam_api64.dll copies and Proton prefixes.",
+                        );
+                        ui.add_enabled(
+                            !self.busy,
+                            egui::Checkbox::new(
+                                &mut self.settings.party,
+                                egui::RichText::new("Party crossplay (no exe patch)").size(12.0),
+                            ),
+                        )
+                        .on_hover_text(
+                            "Keep the original PlayFab Party crossplay path instead of patching the exe to Steam matchmaking.",
+                        );
+                        ui.add_enabled(
+                            !self.busy,
+                            egui::Checkbox::new(
+                                &mut self.settings.skip_intro,
+                                egui::RichText::new("Skip intro").size(12.0),
+                            ),
+                        )
+                        .on_hover_text(
+                            "Marks the intro video and crossplay popup as seen in every Proton profile before launch, so the next start goes straight to the frontend.",
+                        );
+                    });
+                    if self.settings.dev_mode {
+                        self.settings.standalone = true;
+                    }
+                    if self.settings.standalone || self.settings.mixed {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Emulator").size(12.0).color(MUTED));
+                            ui.add_sized(
+                                [card_w - 150.0, 26.0],
+                                egui::TextEdit::singleline(&mut self.emulator)
+                                    .hint_text("Steam emulator folder (auto-detected when empty)")
+                                    .font(FontId::proportional(13.0)),
+                            )
+                            .on_hover_text(
+                                "Goldberg release with regular/x64/steam_api64.dll. Also read from SE_STEAM_EMULATOR.",
+                            );
+                        });
+                    }
                     ui.horizontal_wrapped(|ui| {
                         let online = match self.server_state.load(Ordering::Relaxed) {
                             SERVER_ONLINE => Some(true),
@@ -415,6 +506,9 @@ impl App {
                             Some(false) => "Server offline",
                             None => "Checking server…",
                         });
+                        if self.settings.dev_mode {
+                            chip(ui, None, "Dev mode");
+                        }
                         match &self.game.found {
                             Ok(_) => {
                                 chip(ui, Some(self.game.patched), if self.game.patched { "Exe patched" } else { "Exe original" });
@@ -438,8 +532,17 @@ impl App {
         ui.scope_builder(egui::UiBuilder::new().max_rect(side), |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(8.0);
-                let label = if self.busy { "LAUNCHING…" } else if self.game.running { "RUNNING" } else { "PLAY" };
-                let can_play = !self.busy && !self.game.running && self.game.found.is_ok();
+                let dev = self.settings.dev_mode;
+                let label = if self.busy {
+                    "LAUNCHING…"
+                } else if self.game.running && !dev {
+                    "RUNNING"
+                } else if self.game.running {
+                    "NEXT PLAYER"
+                } else {
+                    "PLAY"
+                };
+                let can_play = !self.busy && self.game.found.is_ok() && (dev || !self.game.running);
                 if play_button(ui, vec2(side.width().min(280.0), 70.0), label, can_play) {
                     self.run(core::play, ctx);
                 }
@@ -519,13 +622,17 @@ impl eframe::App for App {
     }
 }
 
-pub fn run() -> eframe::Result {
+pub fn run(overrides: crate::Overrides) -> eframe::Result {
+    let title = match crate::instance_id() {
+        Some(id) => format!("Second Extinction — Custom Server [{id}]"),
+        None => "Second Extinction — Custom Server".to_string(),
+    };
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 740.0])
             .with_min_inner_size([820.0, 600.0])
-            .with_title("Second Extinction — Custom Server"),
+            .with_title(title),
         ..Default::default()
     };
-    eframe::run_native("se-launcher", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native("se-launcher", opts, Box::new(move |cc| Ok(Box::new(App::new(cc, overrides)))))
 }
