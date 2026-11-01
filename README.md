@@ -13,6 +13,23 @@ Prepares Second Extinction (Steam, Linux/Proton) for a custom backend from
 6. Runs `steam -applaunch 1024380 --social-host <server> --social-port 8443 --social-disable-ssl`
    (or, in standalone mode, starts the exe through Proton directly without Steam).
 
+## Windows
+
+The launcher also runs natively on Windows (`se-launcher-windows-x86_64.exe` from
+the CI artifacts). There is no Proton prefix there: the server CA and the WinHTTP
+proxy go into the real registry (`HKLM`), so the first setup and **Revert** ask for
+administrator rights (UAC). The game is started through `steam.exe -applaunch`, or
+directly with the Goldberg DLL when playing without Steam. Settings and players
+live in `%APPDATA%\se-launcher`. Mixed mode uses hard links instead of symlinks
+for the shadow game directory, so it must be on the same drive as the game.
+
+## Building
+
+`cargo build --release` for Linux. OneDev builds both platforms on every push to
+`main` and on `v*` tags (`.onedev-buildspec.yml`): Linux in `rust:1.98-bookworm`,
+Windows cross-compiled there for `x86_64-pc-windows-gnu` with mingw-w64. The
+binaries are published as job artifacts.
+
 ## Usage
 ```
 cargo install --path .

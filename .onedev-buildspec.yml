@@ -1,0 +1,63 @@
+# Builds se-launcher for Linux (x86_64, glibc from Debian bookworm) and Windows
+# (x86_64, cross-compiled with mingw-w64) and publishes both as job artifacts.
+version: 47
+jobs:
+- name: Build
+  jobExecutor: docker-linux
+  steps:
+  - type: CheckoutStep
+    name: checkout
+    cloneCredential:
+      type: DefaultCredential
+    withLfs: false
+    withSubmodules: false
+    condition: SUCCESSFUL
+    optional: false
+  - type: CommandStep
+    name: build linux
+    runInContainer: true
+    image: rust:1.98-bookworm
+    interpreter:
+      type: DefaultInterpreter
+      commands: |
+        set -e
+        cargo build --release --locked
+        mkdir -p dist
+        cp target/release/se-launcher dist/se-launcher-linux-x86_64
+    runAs: "0:0"
+    useTTY: false
+    condition: SUCCESSFUL
+    optional: false
+  - type: CommandStep
+    name: build windows
+    runInContainer: true
+    image: rust:1.98-bookworm
+    interpreter:
+      type: DefaultInterpreter
+      commands: |
+        set -e
+        apt-get update -qq
+        apt-get install -y -qq gcc-mingw-w64-x86-64 >/dev/null
+        rustup target add x86_64-pc-windows-gnu
+        cargo build --release --locked --target x86_64-pc-windows-gnu
+        mkdir -p dist
+        cp target/x86_64-pc-windows-gnu/release/se-launcher.exe dist/se-launcher-windows-x86_64.exe
+    runAs: "0:0"
+    useTTY: false
+    condition: SUCCESSFUL
+    optional: false
+  - type: PublishArtifactStep
+    name: publish binaries
+    artifacts: dist/*
+    condition: SUCCESSFUL
+    optional: false
+  triggers:
+  - type: BranchUpdateTrigger
+    branches: main
+    userMatch: anyone
+  - type: TagCreateTrigger
+    tags: v*
+  retryCondition: never
+  maxRetries: 3
+  retryDelay: 30
+  timeout: 3600

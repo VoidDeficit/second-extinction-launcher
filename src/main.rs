@@ -26,6 +26,12 @@ struct Instance {
 static INSTANCE: OnceLock<Instance> = OnceLock::new();
 
 /// Default state root: `$XDG_CONFIG_HOME/se-launcher` (or `~/.config/se-launcher`).
+#[cfg(windows)]
+fn default_data_root() -> Option<PathBuf> {
+    Some(PathBuf::from(env::var_os("APPDATA")?).join("se-launcher"))
+}
+
+#[cfg(not(windows))]
 fn default_data_root() -> Option<PathBuf> {
     let base = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)

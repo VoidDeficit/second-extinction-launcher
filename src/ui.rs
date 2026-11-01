@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::{env, thread};
+use std::thread;
 
 const GOLD: Color32 = Color32::from_rgb(0xE8, 0xA3, 0x17);
 const GOLD_HI: Color32 = Color32::from_rgb(0xFF, 0xCC, 0x4D);
@@ -58,11 +58,8 @@ struct App {
 }
 
 fn art_dir() -> Option<PathBuf> {
-    let home = PathBuf::from(env::var_os("HOME")?);
-    [".local/share/Steam", ".steam/steam", ".var/app/com.valvesoftware.Steam/.local/share/Steam"]
-        .iter()
-        .map(|p| home.join(p).join("appcache/librarycache").join(core::APP_ID))
-        .find(|p| p.is_dir())
+    let p = core::steam_root().ok()?.join("appcache/librarycache").join(core::APP_ID);
+    p.is_dir().then_some(p)
 }
 
 fn load_texture(ctx: &egui::Context, name: &str) -> Option<TextureHandle> {

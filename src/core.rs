@@ -102,7 +102,25 @@ pub struct Status {
     pub ca_thumbprint: Option<String>,
 }
 
-fn steam_root() -> Result<PathBuf> {
+#[cfg(windows)]
+pub(crate) fn steam_root() -> Result<PathBuf> {
+    // HKCU\Software\Valve\Steam\SteamPath, written by the Steam client
+    let out = hidden(Command::new("reg"))
+        .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let from_reg = out.lines().find_map(|l| l.split("REG_SZ").nth(1)).map(|p| PathBuf::from(p.trim()));
+    from_reg
+        .into_iter()
+        .chain([PathBuf::from(r"C:\Program Files (x86)\Steam")])
+        .find(|p| p.join("steamapps").is_dir())
+        .ok_or_else(|| "Steam installation not found".into())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn steam_root() -> Result<PathBuf> {
     let home = PathBuf::from(env::var("HOME").map_err(|_| "HOME not set")?);
     [".local/share/Steam", ".steam/steam", ".var/app/com.valvesoftware.Steam/.local/share/Steam"]
         .iter()
@@ -230,6 +248,34 @@ pub fn find_game(s: &Settings) -> Result<Game> {
     Ok(Game { dir, compat: lib.join("steamapps/compatdata").join(APP_ID) })
 }
 
+/// A command that does not flash a console window.
+#[cfg(windows)]
+fn hidden(mut cmd: Command) -> Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    cmd
+}
+
+#[cfg(windows)]
+fn tasklist(filter: &str) -> String {
+    hidden(Command::new("tasklist"))
+        .args(["/NH", "/FO", "CSV", "/FI", filter])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(windows)]
+pub fn game_running() -> bool {
+    tasklist(&format!("IMAGENAME eq {EXE}")).contains(EXE)
+}
+
+#[cfg(windows)]
+fn steam_game_running() -> bool {
+    game_running()
+}
+
+#[cfg(not(windows))]
 pub fn game_running() -> bool {
     fs::read_dir("/proc").into_iter().flatten().flatten().any(|e| {
         fs::read(e.path().join("cmdline"))
@@ -243,6 +289,7 @@ pub fn game_running() -> bool {
 }
 
 /// The real Steam client's game process, not the shadow/Goldberg one.
+#[cfg(not(windows))]
 fn steam_game_running() -> bool {
     fs::read_dir("/proc").into_iter().flatten().flatten().any(|e| {
         fs::read(e.path().join("cmdline"))
@@ -257,8 +304,15 @@ fn steam_game_running() -> bool {
 }
 
 /// Unix path as a Windows path inside Proton's `Z:` drive (which maps to `/`).
+#[cfg(not(windows))]
 fn wine_path(p: &Path) -> String {
     format!("Z:{}", p.display()).replace('/', "\\")
+}
+
+/// Already a Windows path.
+#[cfg(windows)]
+fn wine_path(p: &Path) -> String {
+    p.display().to_string()
 }
 
 /// The emulator DLL carries `GseAppPath`/`GseSavePath`; the real Steam DLL doesn't.
@@ -476,6 +530,7 @@ fn reg_file(ca_der: Option<&[u8]>, thumb: &str, proxy: Option<&str>) -> String {
     s
 }
 
+#[cfg(not(windows))]
 /// Proton installation for this prefix, from compatdata/<app>/config_info
 /// (line 2 = fonts dir, e.g. <proton>/files/share/fonts/).
 fn proton_root(compat: &Path) -> Result<PathBuf> {
@@ -491,6 +546,7 @@ fn proton_root(compat: &Path) -> Result<PathBuf> {
 }
 
 /// Proton's wine binary for this prefix.
+#[cfg(not(windows))]
 fn proton_wine(compat: &Path) -> Result<PathBuf> {
     let wine = proton_root(compat)?.join("files/bin/wine");
     if !wine.is_file() {
@@ -499,11 +555,37 @@ fn proton_wine(compat: &Path) -> Result<PathBuf> {
     Ok(wine)
 }
 
+fn reg_utf16(reg: &str) -> Vec<u8> {
+    [0xFEFFu16].into_iter().chain(reg.encode_utf16()).flat_map(|c| c.to_le_bytes()).collect()
+}
+
+/// Native Windows: import into the real registry. HKLM needs elevation, so a
+/// failed import is retried through a UAC prompt.
+#[cfg(windows)]
+fn import_reg(_compat: &Path, reg: &str) -> Result<()> {
+    let tmp = env::temp_dir().join(format!("se-launcher-{}.reg", std::process::id()));
+    fs::write(&tmp, reg_utf16(reg)).map_err(|e| format!("write reg: {e}"))?;
+    let ok = hidden(Command::new("reg")).arg("import").arg(&tmp).status().is_ok_and(|s| s.success());
+    let ok = ok || hidden(Command::new("powershell"))
+        .args(["-NoProfile", "-Command"])
+        .arg(format!(
+            "$p = Start-Process reg -ArgumentList 'import','\"{}\"' -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode",
+            tmp.display()
+        ))
+        .status()
+        .is_ok_and(|s| s.success());
+    fs::remove_file(&tmp).ok();
+    if !ok {
+        return Err("registry import failed (administrator rights are needed for the CA and WinHTTP proxy)".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn import_reg(compat: &Path, reg: &str) -> Result<()> {
     let wine = proton_wine(compat)?;
     let tmp = env::temp_dir().join(format!("se-launcher-{}.reg", std::process::id()));
-    let utf16: Vec<u8> = [0xFEFFu16].into_iter().chain(reg.encode_utf16()).flat_map(|c| c.to_le_bytes()).collect();
-    fs::write(&tmp, utf16).map_err(|e| format!("write reg: {e}"))?;
+    fs::write(&tmp, reg_utf16(reg)).map_err(|e| format!("write reg: {e}"))?;
     let status = Command::new(&wine)
         .env("WINEPREFIX", compat.join("pfx"))
         .env("WINEDEBUG", "-all")
@@ -519,8 +601,17 @@ fn import_reg(compat: &Path, reg: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn state_file(compat: &Path) -> PathBuf {
     compat.join("se-launcher-ca.sha1")
+}
+
+/// There is no prefix on Windows; keep the state with the launcher's data.
+#[cfg(windows)]
+fn state_file(_compat: &Path) -> PathBuf {
+    let dir = crate::instance_dir().map(Path::to_path_buf).unwrap_or_else(env::temp_dir);
+    fs::create_dir_all(&dir).ok();
+    dir.join("se-launcher-ca.sha1")
 }
 
 /// The game keeps the "already seen" flags in its per-prefix settings.json.
@@ -528,10 +619,18 @@ fn state_file(compat: &Path) -> PathBuf {
 /// so the launcher marks them before each launch.
 fn settings_files(compat: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let users = compat.join("pfx/drive_c/users");
-    let Ok(entries) = fs::read_dir(&users) else { return out };
-    for user in entries.flatten() {
-        let base = user.path().join("Saved Games/Avalanche Studios/Second Extinction");
+    #[cfg(windows)]
+    let users: Vec<PathBuf> = {
+        let _ = compat;
+        env::var_os("USERPROFILE").map(PathBuf::from).into_iter().collect()
+    };
+    #[cfg(not(windows))]
+    let users: Vec<PathBuf> = match fs::read_dir(compat.join("pfx/drive_c/users")) {
+        Ok(entries) => entries.flatten().map(|e| e.path()).collect(),
+        Err(_) => return out,
+    };
+    for user in users {
+        let base = user.join("Saved Games/Avalanche Studios/Second Extinction");
         let Ok(platforms) = fs::read_dir(&base) else { continue };
         for platform in platforms.flatten() {
             let file = platform.path().join("settings.json");
@@ -656,7 +755,7 @@ pub fn revert_prefix(g: &Game, log: &dyn Fn(String)) -> Result<()> {
 }
 
 pub fn launch_args(s: &Settings) -> Vec<String> {
-    let mut v: Vec<String> = ["--social-host", &s.server, "--social-port", &s.social_port.to_string(), "--social-disable-ssl"]
+    let v: Vec<String> = ["--social-host", &s.server, "--social-port", &s.social_port.to_string(), "--social-disable-ssl"]
         .iter()
         .map(|a| a.to_string())
         .collect();
@@ -676,7 +775,11 @@ pub fn launch(g: &Game, s: &Settings, player: Option<&Player>, log: &dyn Fn(Stri
 }
 
 fn launch_via_steam(args: &[String], log: &dyn Fn(String)) -> Result<()> {
-    Command::new("steam")
+    #[cfg(windows)]
+    let steam = steam_root()?.join("steam.exe");
+    #[cfg(not(windows))]
+    let steam = PathBuf::from("steam");
+    Command::new(&steam)
         .args(["-applaunch", APP_ID])
         .args(args)
         .spawn()
@@ -685,6 +788,25 @@ fn launch_via_steam(args: &[String], log: &dyn Fn(String)) -> Result<()> {
     Ok(())
 }
 
+/// Start the exe directly; the Steam emulator provides steam_api64.dll.
+#[cfg(windows)]
+fn launch_standalone(g: &Game, player: Option<&Player>, args: &[String], log: &dyn Fn(String)) -> Result<()> {
+    let mut cmd = Command::new(g.dir.join(EXE));
+    cmd.current_dir(&g.dir).env("SteamAppId", APP_ID).env("SteamGameId", APP_ID).args(args);
+    if let Some(p) = player {
+        cmd.env("GseAppPath", wine_path(&p.dir))
+            .env("GseSavePath", wine_path(&p.dir.join("saves")))
+            .env("GseExeDir", wine_path(&g.dir));
+    }
+    let child = cmd.spawn().map_err(|e| format!("start {EXE}: {e}"))?;
+    if let Some(p) = player {
+        fs::write(p.dir.join("pid"), format!("{}\n", child.id())).ok();
+    }
+    log(format!("Started (standalone): {EXE} {}", args.join(" ")));
+    Ok(())
+}
+
+#[cfg(not(windows))]
 /// Start the exe through Proton without Steam. Proton's launcher sets up the
 /// prefix and the Wine environment itself; the real Steam client is never used,
 /// so the Steam emulator must provide the game's steam_api64.dll.
@@ -722,8 +844,21 @@ fn launch_standalone(g: &Game, player: Option<&Player>, args: &[String], log: &d
     Ok(())
 }
 
+#[cfg(windows)]
+fn player_running(dir: &Path) -> bool {
+    let pid = fs::read_to_string(dir.join("pid")).ok().and_then(|t| t.trim().parse::<u32>().ok());
+    match pid {
+        Some(pid) if tasklist(&format!("PID eq {pid}")).contains(&format!("\"{pid}\"")) => true,
+        _ => {
+            fs::remove_file(dir.join("pid")).ok();
+            false
+        }
+    }
+}
+
 /// True while a process has this player's emulator settings path in its environment,
 /// or while the Proton process recorded for the slot is still alive.
+#[cfg(not(windows))]
 fn player_running(dir: &Path) -> bool {
     if let Ok(text) = fs::read_to_string(dir.join("pid")) {
         if let Ok(pid) = text.trim().parse::<u32>() {
@@ -794,6 +929,13 @@ fn player_steamid(dir: &Path) -> Result<u64> {
 /// Dev players need separate Wine prefixes: the game keeps a single-instance lock
 /// (and its own settings) per prefix, so sharing one makes the second client refuse
 /// to start. The first launch for a player copies the already-configured prefix.
+/// No Wine prefixes on Windows: every client uses the real user profile.
+#[cfg(windows)]
+fn clone_prefix(_src: &Path, _dest: &Path, _log: &dyn Fn(String)) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn clone_prefix(src: &Path, dest: &Path, log: &dyn Fn(String)) -> Result<()> {
     if dest.join("pfx").is_dir() {
         return Ok(());
@@ -906,6 +1048,22 @@ pub fn prepare_standalone_identity(g: &Game, local: Option<&SteamAccount>, log: 
     Ok(())
 }
 
+#[cfg(not(windows))]
+fn link_into_shadow(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dest)
+}
+
+/// Symlinks need extra rights on Windows: hard-link files (same volume),
+/// and junction-free directory links are not needed by the game.
+#[cfg(windows)]
+fn link_into_shadow(src: &Path, dest: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        std::os::windows::fs::symlink_dir(src, dest)
+    } else {
+        fs::hard_link(src, dest).or_else(|_| fs::copy(src, dest).map(|_| ()))
+    }
+}
+
 fn mixed_game_dir() -> Result<PathBuf> {
     let root = crate::instance_dir().ok_or("launcher instance not initialized")?;
     Ok(root.join("mixed/game"))
@@ -930,8 +1088,7 @@ fn sync_shadow(src: &Path, shadow: &Path, emulator: &Path, log: &dyn Fn(String))
         {
             continue;
         }
-        std::os::unix::fs::symlink(entry.path(), shadow.join(name.as_ref()))
-            .map_err(|e| format!("link {name}: {e}"))?;
+        link_into_shadow(&entry.path(), &shadow.join(name.as_ref())).map_err(|e| format!("link {name}: {e}"))?;
     }
     fs::copy(emulator, shadow.join("steam_api64.dll")).map_err(|e| format!("install emulator in shadow: {e}"))?;
     // The guest is PlayFab-only: give its exe the original PlayFab Party byte
