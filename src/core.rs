@@ -1038,6 +1038,7 @@ fn write_party_relay(dir: &Path, s: &Settings, log: &dyn Fn(String)) -> Result<(
     fs::write(dir.join("party_relay.txt"), format!("{relay}\n"))
         .map_err(|e| format!("write party_relay.txt in {}: {e}", dir.display()))?;
     log(format!("Party relay {relay} written to {}", dir.display()));
+    crate::map::sync_in_background(dir, &s.server, s.party_port);
     Ok(())
 }
 

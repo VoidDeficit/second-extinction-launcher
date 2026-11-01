@@ -5,6 +5,7 @@
 //!   se-launcher --server HOST [--social-port N] [--proxy-port N] [--party-port N] [--game-dir DIR] [--no-launch]
 //!   se-launcher --revert [--game-dir DIR]
 
+mod map;
 mod core;
 mod ui;
 
