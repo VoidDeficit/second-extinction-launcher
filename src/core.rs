@@ -31,6 +31,8 @@ pub struct Settings {
     pub server: String,
     pub social_port: u16,
     pub proxy_port: u16,
+    /// PlayFab Party relay port on the server (written to party_relay.txt for the shim).
+    pub party_port: u16,
     pub game_dir: Option<PathBuf>,
     /// Start the game through Proton directly instead of asking Steam to launch it.
     pub standalone: bool,
@@ -52,6 +54,7 @@ impl Default for Settings {
             server: "127.0.0.1".into(),
             social_port: 8443,
             proxy_port: 8888,
+            party_port: 8450,
             game_dir: None,
             standalone: false,
             dev_mode: false,
@@ -956,6 +959,16 @@ fn clone_prefix(src: &Path, dest: &Path, log: &dyn Fn(String)) -> Result<()> {
     Ok(())
 }
 
+/// The PartyWin.dll shim connects to the relay named in party_relay.txt
+/// (`host:port`) next to the game executable.
+fn write_party_relay(dir: &Path, s: &Settings, log: &dyn Fn(String)) -> Result<()> {
+    let relay = format!("{}:{}", s.server, s.party_port);
+    fs::write(dir.join("party_relay.txt"), format!("{relay}\n"))
+        .map_err(|e| format!("write party_relay.txt in {}: {e}", dir.display()))?;
+    log(format!("Party relay {relay} written to {}", dir.display()));
+    Ok(())
+}
+
 fn party_entity(steamid: u64) -> String {
     format!("{steamid:016X}")
 }
@@ -1140,6 +1153,7 @@ fn play_mixed(s: &Settings, log: &dyn Fn(String)) -> Result<()> {
     let compat = player.dir.join("compatdata").join(APP_ID);
     clone_prefix(&g.compat, &compat, log)?;
 
+    write_party_relay(&g.dir, s, log)?;
     let shadow = mixed_game_dir()?;
     let emu_dll = find_emulator_dll(s)?;
     sync_shadow(&g.dir, &shadow, &emu_dll, log)?;
@@ -1188,6 +1202,7 @@ pub fn play(s: &Settings, log: &dyn Fn(String)) -> Result<()> {
     } else {
         patch_exe(&g, log)?;
     }
+    write_party_relay(&g.dir, s, log)?;
     if s.standalone || s.dev_mode {
         install_emulator(&g, s, log)?;
     } else {

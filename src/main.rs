@@ -2,7 +2,7 @@
 //!
 //! Without arguments it opens a window; with arguments it runs as a CLI:
 //!   se-launcher [--data-dir DIR] [--instance-id ID] [--standalone] [--dev-mode]
-//!   se-launcher --server HOST [--social-port N] [--proxy-port N] [--game-dir DIR] [--no-launch]
+//!   se-launcher --server HOST [--social-port N] [--proxy-port N] [--party-port N] [--game-dir DIR] [--no-launch]
 //!   se-launcher --revert [--game-dir DIR]
 
 mod core;
@@ -72,6 +72,7 @@ pub fn load_settings() -> Settings {
             Some(("server", v)) => s.server = v.to_string(),
             Some(("social_port", v)) => s.social_port = v.parse().unwrap_or(s.social_port),
             Some(("proxy_port", v)) => s.proxy_port = v.parse().unwrap_or(s.proxy_port),
+            Some(("party_port", v)) => s.party_port = v.parse().unwrap_or(s.party_port),
             Some(("game_dir", v)) if !v.is_empty() => s.game_dir = Some(PathBuf::from(v)),
             Some(("standalone", v)) => s.standalone = matches!(v, "1" | "true" | "yes"),
             Some(("dev_mode", v)) => s.dev_mode = matches!(v, "1" | "true" | "yes"),
@@ -91,10 +92,11 @@ pub fn save_settings(s: &Settings) {
     let dir = s.game_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
     let emulator = s.emulator_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
     fs::write(p, format!(
-        "server={}\nsocial_port={}\nproxy_port={}\ngame_dir={dir}\nstandalone={}\ndev_mode={}\nmixed={}\nparty={}\nskip_intro={}\nemulator_dir={emulator}\n",
+        "server={}\nsocial_port={}\nproxy_port={}\nparty_port={}\ngame_dir={dir}\nstandalone={}\ndev_mode={}\nmixed={}\nparty={}\nskip_intro={}\nemulator_dir={emulator}\n",
         s.server,
         s.social_port,
         s.proxy_port,
+        s.party_port,
         u8::from(s.standalone),
         u8::from(s.dev_mode),
         u8::from(s.mixed),
@@ -111,7 +113,7 @@ fn usage() -> ! {
         "usage: se-launcher [--data-dir DIR] [--instance-id ID] [--standalone]\n\
          \x20                  (opens the launcher window)\n\
          \x20      se-launcher [--data-dir DIR] [--instance-id ID] --server HOST\n\
-         \x20                  [--social-port 8443] [--proxy-port 8888]\n\
+         \x20                  [--social-port 8443] [--proxy-port 8888] [--party-port 8450]\n\
          \x20                  [--game-dir DIR] [--emulator-dir DIR] [--no-launch]\n\
          \x20                  [--standalone] [--dev-mode] [--mixed] [--party]\n\
          \x20      se-launcher [--data-dir DIR] [--instance-id ID] --revert [--game-dir DIR]\n\
@@ -188,6 +190,7 @@ fn run_cli(args: Vec<String>, overrides: Overrides) {
             "--server" => server = Some(val()),
             "--social-port" => s.social_port = val().parse().unwrap_or_else(|_| usage()),
             "--proxy-port" => s.proxy_port = val().parse().unwrap_or_else(|_| usage()),
+            "--party-port" => s.party_port = val().parse().unwrap_or_else(|_| usage()),
             "--game-dir" => s.game_dir = Some(PathBuf::from(val())),
             "--mixed" => s.mixed = true,
             "--party" => s.party = true,

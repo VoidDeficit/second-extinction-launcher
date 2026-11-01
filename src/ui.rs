@@ -43,6 +43,7 @@ struct App {
     settings: Settings,
     social_port: String,
     proxy_port: String,
+    party_port: String,
     emulator: String,
     log: Vec<String>,
     show_log: bool,
@@ -254,6 +255,7 @@ impl App {
         let mut app = App {
             social_port: settings.social_port.to_string(),
             proxy_port: settings.proxy_port.to_string(),
+            party_port: settings.party_port.to_string(),
             emulator,
             settings,
             log: Vec::new(),
@@ -282,7 +284,9 @@ impl App {
     }
 
     fn apply_form(&mut self) -> Option<Settings> {
-        let (Ok(sp), Ok(pp)) = (self.social_port.trim().parse(), self.proxy_port.trim().parse()) else {
+        let (Ok(sp), Ok(pp), Ok(rp)) =
+            (self.social_port.trim().parse(), self.proxy_port.trim().parse(), self.party_port.trim().parse())
+        else {
             self.log.push("Error: ports must be numbers between 1 and 65535".into());
             self.show_log = true;
             return None;
@@ -295,6 +299,7 @@ impl App {
         }
         self.settings.social_port = sp;
         self.settings.proxy_port = pp;
+        self.settings.party_port = rp;
         let emulator = self.emulator.trim();
         self.settings.emulator_dir = (!emulator.is_empty()).then(|| PathBuf::from(emulator));
         if self.settings.dev_mode {
@@ -408,13 +413,15 @@ impl App {
                     ui.label(egui::RichText::new("SERVER").size(12.0).color(GOLD).strong());
                     ui.horizontal(|ui| {
                         let server = ui.add_sized(
-                            [card_w - 230.0, 30.0],
+                            [card_w - 300.0, 30.0],
                             egui::TextEdit::singleline(&mut self.settings.server).hint_text("IP or hostname").font(FontId::proportional(17.0)),
                         );
                         ui.add_sized([62.0, 30.0], egui::TextEdit::singleline(&mut self.social_port).font(FontId::proportional(15.0)))
                             .on_hover_text("Apex Connect port");
                         ui.add_sized([62.0, 30.0], egui::TextEdit::singleline(&mut self.proxy_port).font(FontId::proportional(15.0)))
                             .on_hover_text("Proxy port");
+                        ui.add_sized([62.0, 30.0], egui::TextEdit::singleline(&mut self.party_port).font(FontId::proportional(15.0)))
+                            .on_hover_text("PlayFab Party relay port (crossplay)");
                         if server.changed() || server.lost_focus() {
                             *self.probe_target.lock().unwrap() =
                                 (self.settings.server.clone(), self.social_port.trim().parse().unwrap_or(self.settings.social_port));
