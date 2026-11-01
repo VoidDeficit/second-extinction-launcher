@@ -13,6 +13,12 @@ Prepares Second Extinction (Steam, Linux/Proton) for a custom backend from
 6. Runs `steam -applaunch 1024380 --social-host <server> --social-port 8443 --social-disable-ssl`
    (or, in standalone mode, starts the exe through Proton directly without Steam).
 
+## Party shim
+
+With **Party crossplay** or mixed mode, the launcher downloads `PartyWin.dll` from the
+latest server release, verifies its SHA-256 and installs it, keeping the original as
+`PartyWin.dll.orig`. A normal Steam-lobby start and **Revert** restore the original.
+
 ## Windows
 
 The launcher also runs natively on Windows (`se-launcher-windows-x86_64.exe` from

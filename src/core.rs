@@ -959,6 +959,78 @@ fn clone_prefix(src: &Path, dest: &Path, log: &dyn Fn(String)) -> Result<()> {
     Ok(())
 }
 
+const SHIM: &str = "PartyWin.dll";
+const SHIM_URL: &str = "https://github.com/VoidDeficit/second-extinction-server/releases/latest/download/PartyWin.dll";
+
+/// Only the shim reads party_relay.txt; Microsoft's DLL never mentions it.
+fn is_shim(dll: &[u8]) -> bool {
+    dll.windows(15).any(|w| w == b"party_relay.txt")
+}
+
+fn download(url: &str) -> Result<Vec<u8>> {
+    let resp = ureq::get(url)
+        .timeout(std::time::Duration::from_secs(30))
+        .call()
+        .map_err(|e| format!("download {url}: {e}"))?;
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut resp.into_reader(), &mut data).map_err(|e| format!("download {url}: {e}"))?;
+    Ok(data)
+}
+
+/// Install the latest released shim, keeping the original as PartyWin.dll.orig.
+/// An installed shim stays in use when the release can't be reached.
+pub fn install_shim(g: &Game, log: &dyn Fn(String)) -> Result<()> {
+    let path = g.dir.join(SHIM);
+    let current = fs::read(&path).unwrap_or_default();
+    let installed = is_shim(&current);
+    let sums = match download(&format!("{SHIM_URL}.sha256")) {
+        Ok(sums) => sums,
+        Err(e) if installed => {
+            log(format!("Keeping the installed Party shim: {e}"));
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    let sums = String::from_utf8_lossy(&sums);
+    let want = sums.split_whitespace().next().unwrap_or_default().to_lowercase();
+    if installed && hex(&Sha256::digest(&current)) == want {
+        log("Party shim is up to date".into());
+        return Ok(());
+    }
+    if game_running() {
+        if installed {
+            log("A newer Party shim exists, but a game client is running; keeping the installed one".into());
+            return Ok(());
+        }
+        return Err("the Party shim must be installed but a game client is running; close it first".into());
+    }
+    let dll = download(SHIM_URL)?;
+    if hex(&Sha256::digest(&dll)) != want || !is_shim(&dll) {
+        return Err("downloaded Party shim failed verification; nothing was changed".into());
+    }
+    let backup = g.dir.join(format!("{SHIM}.orig"));
+    if !installed && !current.is_empty() && !backup.exists() {
+        fs::copy(&path, &backup).map_err(|e| format!("back up {SHIM}: {e}"))?;
+    }
+    let tmp = g.dir.join(format!("{SHIM}.new"));
+    fs::write(&tmp, &dll).map_err(|e| format!("write {SHIM}: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("replace {SHIM}: {e}"))?;
+    log("Installed the Party shim".into());
+    Ok(())
+}
+
+/// Put Microsoft's DLL back if the shim is installed.
+pub fn restore_shim(g: &Game, log: &dyn Fn(String)) -> Result<()> {
+    let path = g.dir.join(SHIM);
+    let backup = g.dir.join(format!("{SHIM}.orig"));
+    if !backup.exists() || !fs::read(&path).is_ok_and(|d| is_shim(&d)) {
+        return Ok(());
+    }
+    fs::copy(&backup, &path).map_err(|e| format!("restore {SHIM}: {e}"))?;
+    log("Restored the original PartyWin.dll".into());
+    Ok(())
+}
+
 /// The PartyWin.dll shim connects to the relay named in party_relay.txt
 /// (`host:port`) next to the game executable.
 fn write_party_relay(dir: &Path, s: &Settings, log: &dyn Fn(String)) -> Result<()> {
@@ -1153,6 +1225,7 @@ fn play_mixed(s: &Settings, log: &dyn Fn(String)) -> Result<()> {
     let compat = player.dir.join("compatdata").join(APP_ID);
     clone_prefix(&g.compat, &compat, log)?;
 
+    install_shim(&g, log)?;
     write_party_relay(&g.dir, s, log)?;
     let shadow = mixed_game_dir()?;
     let emu_dll = find_emulator_dll(s)?;
@@ -1199,8 +1272,12 @@ pub fn play(s: &Settings, log: &dyn Fn(String)) -> Result<()> {
     }
     if s.party {
         ensure_original_exe(&g, log)?;
+        install_shim(&g, log)?;
     } else {
         patch_exe(&g, log)?;
+        if !game_running() {
+            restore_shim(&g, log)?;
+        }
     }
     write_party_relay(&g.dir, s, log)?;
     if s.standalone || s.dev_mode {
@@ -1235,6 +1312,7 @@ pub fn revert(s: &Settings, log: &dyn Fn(String)) -> Result<()> {
     }
     let g = find_game(s)?;
     revert_exe(&g, log)?;
+    restore_shim(&g, log)?;
     restore_emulator(&g, log);
     revert_prefix(&g, log)
 }
@@ -1328,6 +1406,30 @@ mod tests {
         let a = local_steam_account().expect("no Steam account found");
         assert!(a.id > 76561197960265728);
         println!("local Steam account: {} ({})", a.display_name(), a.id);
+    }
+
+    /// Needs the network and no running game: cargo test -- --ignored shim_install
+    #[test]
+    #[ignore]
+    fn shim_install_and_restore_from_release() {
+        let dir = env::temp_dir().join(format!("se-launcher-shim-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let g = Game { dir: dir.clone(), compat: dir.clone() };
+        fs::write(dir.join(SHIM), b"original").unwrap();
+        install_shim(&g, &|_| {}).unwrap();
+        assert!(is_shim(&fs::read(dir.join(SHIM)).unwrap()));
+        assert_eq!(fs::read(dir.join("PartyWin.dll.orig")).unwrap(), b"original");
+        install_shim(&g, &|_| {}).unwrap();
+        assert_eq!(fs::read(dir.join("PartyWin.dll.orig")).unwrap(), b"original");
+        restore_shim(&g, &|_| {}).unwrap();
+        assert_eq!(fs::read(dir.join(SHIM)).unwrap(), b"original");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn shim_is_recognized_by_its_relay_file_name() {
+        assert!(is_shim(b"xx party_relay.txt yy"));
+        assert!(!is_shim(b"Microsoft PlayFab Party"));
     }
 
     #[test]
