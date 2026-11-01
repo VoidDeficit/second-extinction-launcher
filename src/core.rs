@@ -710,6 +710,15 @@ pub fn setup_prefix(g: &Game, s: &Settings, log: &dyn Fn(String)) -> Result<()> 
     if s.skip_intro {
         skip_intro(&g.compat, log)?;
     }
+    // With the shim nothing has to be set up; only clear what older versions installed.
+    if s.party || s.mixed {
+        if state_file(&g.compat).exists() && !game_running() {
+            if let Err(e) = revert_prefix(g, log) {
+                log(format!("Could not remove the old server CA: {e}"));
+            }
+        }
+        return Ok(());
+    }
     let url = format!("http://{}:{}/ca.pem", s.server, s.social_port);
     log(format!("Fetching server CA from {url}"));
     let pem = ureq::get(&url)
@@ -1035,7 +1044,8 @@ pub fn restore_shim(g: &Game, log: &dyn Fn(String)) -> Result<()> {
 /// (`host:port`) next to the game executable.
 fn write_party_relay(dir: &Path, s: &Settings, log: &dyn Fn(String)) -> Result<()> {
     let relay = format!("{}:{}", s.server, s.party_port);
-    fs::write(dir.join("party_relay.txt"), format!("{relay}\n"))
+    // the shim also routes the game's web requests here, so no CA or system proxy is needed
+    fs::write(dir.join("party_relay.txt"), format!("{relay}\nproxy {}:{}\n", s.server, s.proxy_port))
         .map_err(|e| format!("write party_relay.txt in {}: {e}", dir.display()))?;
     log(format!("Party relay {relay} written to {}", dir.display()));
     crate::map::sync_in_background(dir, &s.server, s.party_port);
