@@ -7,9 +7,9 @@ Prepares Second Extinction (Steam, Linux/Proton) for a custom backend from
 1. Finds the game in your Steam libraries (`libraryfolders.vdf`) or uses `--game-dir`.
 2. Patches `SecondExtinction_F.exe`. It backs up the original to `SecondExtinction_F.exe.orig` and only patches the known build (checked by sha256).
    The patch clears the crossplay default, so the game hosts lobbies with Steam matchmaking instead of PlayFab Party.
-With **Party crossplay** or mixed mode, steps 3 and 4 are skipped: the Party shim sends the
-game's web requests to the server and accepts its certificate, so no CA is installed and
-Windows needs no administrator rights. A CA left by an older version is removed.
+With **Party crossplay** or mixed mode, steps 3 and 4 are skipped: a small `winhttp.dll` beside the
+game sends its web requests to the server and accepts its certificate, so no CA is installed
+and Windows needs no administrator rights. A CA left by an older version is removed.
 
 3. Downloads the server's CA from `http://<server>:8443/ca.pem`.
 4. Imports it into the game's Proton prefix as a trusted root.

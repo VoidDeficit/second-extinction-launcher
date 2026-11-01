@@ -717,7 +717,7 @@ pub fn setup_prefix(g: &Game, s: &Settings, log: &dyn Fn(String)) -> Result<()> 
                 log(format!("Could not remove the old server CA: {e}"));
             }
         }
-        return Ok(());
+        return prefer_local_winhttp(g, log);
     }
     let url = format!("http://{}:{}/ca.pem", s.server, s.social_port);
     log(format!("Fetching server CA from {url}"));
@@ -755,6 +755,27 @@ pub fn setup_prefix(g: &Game, s: &Settings, log: &dyn Fn(String)) -> Result<()> 
     import_reg(&g.compat, &reg_file(Some(&der), &thumb, Some(&proxy)))?;
     fs::write(state_file(&g.compat), format!("{thumb}\n{proxy}\n")).ok();
     log(format!("Prefix trusts CA {thumb}, WinHTTP proxy {proxy}"));
+    Ok(())
+}
+
+/// Windows loads winhttp.dll from the game folder by itself; Proton needs telling.
+#[cfg(windows)]
+fn prefer_local_winhttp(_g: &Game, _log: &dyn Fn(String)) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn prefer_local_winhttp(g: &Game, log: &dyn Fn(String)) -> Result<()> {
+    let marker = g.compat.join("se-launcher-winhttp");
+    if marker.exists() {
+        return Ok(());
+    }
+    if game_running() {
+        return Err("the game prefix needs a setting but a game client is running; close it first".into());
+    }
+    import_reg(&g.compat, "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\Wine\\DllOverrides]\r\n\"winhttp\"=\"native,builtin\"\r\n")?;
+    fs::write(&marker, "").ok();
+    log("Prefix uses the game folder's winhttp.dll".into());
     Ok(())
 }
 
@@ -969,6 +990,8 @@ fn clone_prefix(src: &Path, dest: &Path, log: &dyn Fn(String)) -> Result<()> {
 }
 
 const SHIM: &str = "PartyWin.dll";
+const WINHTTP: &str = "winhttp.dll";
+const WINHTTP_URL: &str = "https://github.com/VoidDeficit/second-extinction-server/releases/latest/download/winhttp.dll";
 const SHIM_URL: &str = "https://github.com/VoidDeficit/second-extinction-server/releases/latest/download/PartyWin.dll";
 
 /// Only the shim reads party_relay.txt; Microsoft's DLL never mentions it.
@@ -989,6 +1012,7 @@ fn download(url: &str) -> Result<Vec<u8>> {
 /// Install the latest released shim, keeping the original as PartyWin.dll.orig.
 /// An installed shim stays in use when the release can't be reached.
 pub fn install_shim(g: &Game, log: &dyn Fn(String)) -> Result<()> {
+    install_winhttp(g, log)?;
     let path = g.dir.join(SHIM);
     let current = fs::read(&path).unwrap_or_default();
     let installed = is_shim(&current);
@@ -1028,10 +1052,43 @@ pub fn install_shim(g: &Game, log: &dyn Fn(String)) -> Result<()> {
     Ok(())
 }
 
+/// winhttp.dll beside the exe routes the game's web requests from before the login on.
+fn install_winhttp(g: &Game, log: &dyn Fn(String)) -> Result<()> {
+    let path = g.dir.join(WINHTTP);
+    let current = fs::read(&path).unwrap_or_default();
+    let want = match download(&format!("{WINHTTP_URL}.sha256")) {
+        Ok(sums) => String::from_utf8_lossy(&sums).split_whitespace().next().unwrap_or_default().to_lowercase(),
+        Err(e) if !current.is_empty() => {
+            log(format!("Keeping the installed {WINHTTP}: {e}"));
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    if hex(&Sha256::digest(&current)) == want {
+        return Ok(());
+    }
+    if game_running() {
+        if !current.is_empty() {
+            return Ok(());
+        }
+        return Err(format!("{WINHTTP} must be installed but a game client is running; close it first"));
+    }
+    let dll = download(WINHTTP_URL)?;
+    if hex(&Sha256::digest(&dll)) != want {
+        return Err(format!("downloaded {WINHTTP} failed verification; nothing was changed"));
+    }
+    let tmp = g.dir.join(format!("{WINHTTP}.new"));
+    fs::write(&tmp, &dll).map_err(|e| format!("write {WINHTTP}: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("replace {WINHTTP}: {e}"))?;
+    log(format!("Installed {WINHTTP}"));
+    Ok(())
+}
+
 /// Put Microsoft's DLL back if the shim is installed.
 pub fn restore_shim(g: &Game, log: &dyn Fn(String)) -> Result<()> {
     let path = g.dir.join(SHIM);
     let backup = g.dir.join(format!("{SHIM}.orig"));
+    fs::remove_file(g.dir.join(WINHTTP)).ok();
     if !backup.exists() || !fs::read(&path).is_ok_and(|d| is_shim(&d)) {
         return Ok(());
     }
