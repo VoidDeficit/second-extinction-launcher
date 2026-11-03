@@ -40,6 +40,17 @@ for the shadow game directory, so it must be on the same drive as the game.
 Windows cross-compiled there for `x86_64-pc-windows-gnu` with mingw-w64. The
 binaries are published as job artifacts.
 
+GitHub Actions builds the same two binaries on a `v*` tag and publishes them as a
+GitHub release (`.github/workflows/release.yml`): `se-launcher-linux-x86_64`,
+`se-launcher-windows-x86_64.exe`, `se-launcher.desktop` and `SHA256SUMS.txt`. To
+cut a release, bump the version in `Cargo.toml`, tag it and push the tag:
+
+```
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The workflow can also be started manually with an existing tag (`workflow_dispatch`).
+
 ## Usage
 ```
 cargo install --path .
